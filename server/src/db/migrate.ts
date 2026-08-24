@@ -25,5 +25,5 @@ export function migrate(db: Database.Database): void {
   if (!taskCols.includes('auto_mode')) {
     db.exec('ALTER TABLE tasks ADD COLUMN auto_mode INTEGER DEFAULT 0');
   }
-  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('schema_version', '3');
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('schema_version', '4');
 }

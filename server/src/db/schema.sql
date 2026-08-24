@@ -270,7 +270,20 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL
 );
 
+-- 人机门决定必须落库：resolver 只存在于进程内存，服务重启后
+-- 确认/验收接口会永远返回 invalid_state，任务再也无法推进。
+CREATE TABLE IF NOT EXISTS gate_decisions (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  gate TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  comment TEXT,
+  created_at INTEGER NOT NULL,
+  consumed_at INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_gates_task ON gate_decisions(task_id, gate, consumed_at);
 CREATE INDEX IF NOT EXISTS idx_transitions_task ON task_transitions(task_id, ts);
 CREATE INDEX IF NOT EXISTS idx_runs_task ON agent_runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_usage_task ON usage_records(task_id);

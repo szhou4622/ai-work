@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { appendFileSync } from 'node:fs';
 import path from 'node:path';
 import { execSync, spawnSync } from 'node:child_process';
@@ -92,18 +92,57 @@ export function isRunning(taskId: string): boolean {
   return contexts.has(taskId);
 }
 
+/** 取出并消费一条已落库、尚未使用的人机门决定 */
+function takePersistedGate(taskId: string, name: string): GateDecision | null {
+  const db = getDb();
+  const row = db.prepare(
+    'SELECT * FROM gate_decisions WHERE task_id = ? AND gate = ? AND consumed_at IS NULL ORDER BY created_at ASC LIMIT 1',
+  ).get(taskId, name) as any;
+  if (!row) return null;
+  db.prepare('UPDATE gate_decisions SET consumed_at = ? WHERE id = ?').run(Date.now(), row.id);
+  return { decision: row.decision, comment: row.comment ?? undefined };
+}
+
 function waitGate(tc: TaskContext, name: string): Promise<GateDecision> {
+  // 重启后可能用户早已点过按钮：先消费已落库的决定，避免永久等待。
+  const persisted = takePersistedGate(tc.taskId, name);
+  if (persisted) return Promise.resolve(persisted);
   return new Promise((resolve) => tc.resolvers.set(name, resolve));
 }
 
-/** 人机门恢复入口（供路由调用） */
+/**
+ * 人机门恢复入口（供路由调用）。
+ * 决定先落库再唤醒：任务未在内存中（例如服务刚重启）时写库并重新拉起任务，
+ * 由 waitGate 消费，而不是直接把用户操作丢掉。
+ */
 export function resumeGate(taskId: string, name: string, decision: string, comment?: string): boolean {
+  const db = getDb();
+  const task = db.prepare('SELECT status FROM tasks WHERE id = ?').get(taskId) as any;
+  if (!task) return false;
+
   const tc = contexts.get(taskId);
-  if (!tc) return false;
-  const resolver = tc.resolvers.get(name);
-  if (!resolver) return false;
-  tc.resolvers.delete(name);
-  resolver({ decision, comment });
+  const resolver = tc?.resolvers.get(name);
+  if (tc && resolver) {
+    tc.resolvers.delete(name);
+    resolver({ decision, comment });
+    return true;
+  }
+
+  // 内存里没有等待者：只有确实停在对应等待状态时才落库补偿。
+  const expected: Record<string, string> = {
+    clarify: 'WAITING_CLARIFICATION',
+    devdoc: 'WAITING_DEVDOC_CONFIRM',
+    acceptance: 'WAITING_ACCEPTANCE',
+  };
+  if (task.status !== expected[name]) return false;
+
+  db.prepare(
+    'INSERT INTO gate_decisions (id, task_id, gate, decision, comment, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(crypto.randomUUID(), taskId, name, decision, comment ?? null, Date.now());
+
+  if (!contexts.has(taskId)) {
+    startTask(taskId).catch((err) => console.error('resumeGate restart failed', err));
+  }
   return true;
 }
 
@@ -512,7 +551,11 @@ async function runPipeline(tc: TaskContext, task: any, deps: EngineDeps): Promis
     const autoNote = task.auto_mode
       ? '\n\n【全自动模式】用户不会回答你的问题。请直接按合理默认假设（简单可用优先）产出开发文档并调用 report，不要提问。'
       : '';
-    const prompt = `本次任务目标：\n${task.objective}\n\n项目背景（历史记忆）：\n${projectMemory(tc.taskId)}${autoNote}`;
+    // 澄清问答与打回意见必须回灌，否则架构师看不到用户回答，会重复提问直到用尽 4 次尝试。
+    const clarifySection = tc.clarifyTranscript.length
+      ? `\n\n已有澄清与修订意见（请直接采纳，不要重复提问）：\n${tc.clarifyTranscript.join('\n')}`
+      : '';
+    const prompt = `本次任务目标：\n${task.objective}\n\n项目背景（历史记忆）：\n${projectMemory(tc.taskId)}${clarifySection}${autoNote}`;
     
     // 优化：增强架构阶段错误处理
     let run: { runId: string; report: string | null; output: string; ok: boolean };
@@ -578,8 +621,17 @@ async function runPipeline(tc: TaskContext, task: any, deps: EngineDeps): Promis
   } // 结束 skipArchitecture 条件块
   else {
     // 跳过架构阶段：使用已有的confirmed devdoc
+    // devdocs 表只存 content_path，正文必须从磁盘读回；早先直接读 .content
+    // 会拿到 undefined，让后续所有角色都收到空开发文档。
     console.log(`[engine] 跳过架构阶段，使用已有开发文档 v${existingDevdoc.version}`);
-    devdoc = { version: existingDevdoc.version, content: existingDevdoc.content || '' };
+    const docPath = existingDevdoc.content_path as string | undefined;
+    const docBody = docPath && existsSync(docPath) ? readFileSync(docPath, 'utf-8').slice(0, 20000) : readDevdoc(tc);
+    if (!docBody.trim()) {
+      return finishTask(tc, deps, 'NEEDS_HUMAN', `已确认的开发文档 v${existingDevdoc.version} 内容缺失（${docPath ?? '路径未记录'}），无法继续`);
+    }
+    devdoc = { version: existingDevdoc.version, content: docBody };
+    // 续跑时对齐版本号，避免修订时又从 v1 开始撞已有版本
+    if (tc.devdocVersion < existingDevdoc.version) tc.devdocVersion = existingDevdoc.version;
   }
 
   // 3. 计划：主调度读取开发文档，产出 plan.json（模块拆解）
@@ -754,12 +806,25 @@ async function runModulesParallel(
   for (const m of modules) {
     const branch = `task/${tc.taskId}/${m.id}`;
     const wtPath = path.join(tc.repo, '.worktrees', m.id);
-    const g = git(tc.repo, ['worktree', 'add', '-b', branch, wtPath]);
+
+    // 重跑/续跑时上一轮的 worktree 和分支往往还在，`worktree add -b` 必然失败。
+    // 之前只检查路径是否在 worktree list 里就当"复用成功"，结果模块在残留的旧
+    // 工作树里执行，实现和审查都对着上一轮的代码，任务无法跑完。这里显式先清理
+    // 再重建，确保每轮都是干净的分支起点。
+    if (git(tc.repo, ['worktree', 'list']).output.includes(wtPath)) {
+      git(tc.repo, ['worktree', 'remove', '--force', wtPath]);
+    }
+    git(tc.repo, ['worktree', 'prune']);
+    if (existsSync(wtPath)) rmSync(wtPath, { recursive: true, force: true });
+
+    let g = git(tc.repo, ['worktree', 'add', '-b', branch, wtPath, 'HEAD']);
     if (!g.ok) {
-      // 已存在则复用
-      if (!git(tc.repo, ['worktree', 'list']).output.includes(wtPath)) {
-        return { ok: false, needHuman: true, reason: `创建 Worktree 失败: ${g.output.slice(0, 500)}`, summary: '', worktrees };
-      }
+      // 分支已存在（上一轮遗留）：复位到当前 HEAD 后再挂载
+      git(tc.repo, ['branch', '-f', branch, 'HEAD']);
+      g = git(tc.repo, ['worktree', 'add', wtPath, branch]);
+    }
+    if (!g.ok) {
+      return { ok: false, needHuman: true, reason: `创建 Worktree 失败: ${g.output.slice(0, 500)}`, summary: '', worktrees };
     }
     worktrees.push({ module: m.id, branch, path: wtPath });
     db.prepare(
