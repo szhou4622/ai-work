@@ -1,0 +1,20 @@
+# AI 工作台 systemd 单元（开发文档 §4.3 / §16）
+# 安装：cp scripts/workbench.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now workbench
+[Unit]
+Description=AI Multi-Agent Dev Workbench
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/AI工作台
+EnvironmentFile=/root/AI工作台/data/workbench.env
+ExecStart=/usr/bin/node /root/AI工作台/server/dist/index.js
+Restart=always
+RestartSec=3
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

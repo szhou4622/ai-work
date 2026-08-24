@@ -1,0 +1,20 @@
+{
+  "name": "ai-workbench",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI 多 Agent 开发工作台 (V1)",
+  "workspaces": [
+    "shared",
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "typecheck": "npm run typecheck -w @workbench/server && npm run typecheck -w @workbench/web",
+    "build": "npm run build -w @workbench/shared && npm run build -w @workbench/server && npm run build -w @workbench/web",
+    "start": "node server/dist/index.js",
+    "dev:server": "npm run dev -w @workbench/server"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

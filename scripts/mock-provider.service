@@ -1,0 +1,13 @@
+[Unit]
+Description=Mock OpenAI Provider (integration test)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/AI工作台
+ExecStart=/usr/bin/node /root/AI工作台/scripts/mock-provider.mjs
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
