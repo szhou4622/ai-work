@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, readdirSync, statSync, mkdirSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 
@@ -24,10 +24,14 @@ export const TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: 'write_file',
-    description: '创建或覆盖写入文件',
+    description: '创建或覆盖写入文件；append=true 时在文件末尾追加（长文档可分批续写）',
     parameters: {
       type: 'object',
-      properties: { path: { type: 'string' }, content: { type: 'string' } },
+      properties: {
+        path: { type: 'string' },
+        content: { type: 'string' },
+        append: { type: 'boolean', description: '为 true 时追加而非覆盖，默认 false' },
+      },
       required: ['path', 'content'],
     },
     permission: 'write',
@@ -155,8 +159,16 @@ export async function executeTool(name: string, args: any, ctx: ToolContext): Pr
         if (!args.path) return { ok: false, output: '参数错误：write_file 必须提供 path（相对工作目录的文件路径）与 content' };
         const p = resolveIn(ctx.workdir, args.path);
         mkdirSync(path.dirname(p), { recursive: true });
-        writeFileSync(p, String(args.content ?? ''), 'utf-8');
-        output = `已写入 ${args.path} (${Buffer.byteLength(String(args.content ?? ''), 'utf-8')} bytes)`;
+        const body = String(args.content ?? '');
+        // append 让被输出长度限制截断的长文档可以分批续写，而不必从头重写
+        if (args.append) {
+          appendFileSync(p, body, 'utf-8');
+          const total = statSync(p).size;
+          output = `已追加 ${args.path} (+${Buffer.byteLength(body, 'utf-8')} bytes，共 ${total} bytes)`;
+        } else {
+          writeFileSync(p, body, 'utf-8');
+          output = `已写入 ${args.path} (${Buffer.byteLength(body, 'utf-8')} bytes)`;
+        }
         break;
       }
       case 'edit_file': {

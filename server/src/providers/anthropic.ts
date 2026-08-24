@@ -24,6 +24,8 @@ export interface AnthropicOptions {
   model: string;
   messages: AnthropicMessage[];
   tools?: AnthropicTool[];
+  /** 系统提示词；Anthropic 是顶层 system 字段，不能放进 messages */
+  system?: string;
   maxTokens?: number;
   timeoutMs?: number;
 }
@@ -64,6 +66,7 @@ export async function anthropicMessages(opts: AnthropicOptions): Promise<Anthrop
         model: opts.model,
         max_tokens: opts.maxTokens ?? 2048,
         messages: opts.messages,
+        ...(opts.system ? { system: opts.system } : {}),
         ...(opts.tools ? { tools: opts.tools } : {}),
       }),
     });

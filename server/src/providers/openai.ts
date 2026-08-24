@@ -21,6 +21,8 @@ export interface ChatCompletionResult {
   tool_calls?: { id: string; type: string; function: { name: string; arguments: string } }[];
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
   model: string;
+  /** 'length' 表示输出被 max_tokens 截断，调用方需据此提示模型或放大预算 */
+  finish_reason: string;
 }
 
 export class OpenAICompatibleError extends Error {
@@ -113,7 +115,8 @@ export async function chatCompletion(opts: ChatCompletionOptions): Promise<ChatC
   }
 
   const usage = json.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-  const message = json.choices?.[0]?.message;
+  const choice = json.choices?.[0];
+  const message = choice?.message;
   return {
     content: message?.content ?? null,
     tool_calls: message?.tool_calls,
@@ -123,6 +126,7 @@ export async function chatCompletion(opts: ChatCompletionOptions): Promise<ChatC
       total_tokens: usage.total_tokens ?? (usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0),
     },
     model: json.model ?? opts.model,
+    finish_reason: choice?.finish_reason ?? '',
   };
 }
 

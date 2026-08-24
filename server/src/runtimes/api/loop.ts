@@ -19,6 +19,8 @@ export interface ApiRunRequest {
   workdir: string;
   permissions: Record<string, boolean>;
   maxSteps?: number;
+  /** 单次回复的最大输出 token；长文档节点（架构/开发文档）应调大 */
+  maxTokens?: number;
 }
 
 export interface ApiRunResult {
@@ -28,6 +30,17 @@ export interface ApiRunResult {
   report?: string;
   usage: { requests: number; prompt_tokens: number; completion_tokens: number };
 }
+
+/**
+ * 两种协议共用的系统提示词。
+ * 之前只有 OpenAI 分支有系统提示，Anthropic 分支完全没有，导致同一任务在
+ * 两种中转下行为不一致（尤其是不知道必须调用 report 收尾）。
+ */
+const SYSTEM_PROMPT = [
+  '你是 AI 多 Agent 开发工作台中的执行 Agent。你拥有工具可以读写文件、执行命令、操作 git。所有路径均相对于工作目录。',
+  '硬性要求：任务完成后必须调用 report 工具输出结构化结果，否则本次运行视为失败。',
+  '写长文档（架构文档、开发文档等）时不要把内容写在回复正文里，一定要用 write_file 落盘；内容较长时分批写入：第一段默认覆盖，后续每段用 append: true 追加到同一文件。',
+].join('\n');
 
 /** 工具执行公共逻辑（权限校验 + 路径限制在工作目录内） */
 async function runTool(name: string, args: any, ctx: { workdir: string; permissions: Record<string, boolean> }, log: (l: string) => void): Promise<{ ok: boolean; output: string }> {
@@ -62,7 +75,7 @@ async function runOpenaiLoop(req: ApiRunRequest, onEvent?: (chunk: string) => vo
   log(`[input] ${req.input.slice(0, 2000)}`);
 
   const messages: any[] = [
-    { role: 'system', content: '你是 AI 多 Agent 开发工作台中的执行 Agent。你拥有工具可以读写文件、执行命令、操作 git。请完成任务并在最后调用 report 工具输出结构化结果。所有路径均相对于工作目录。' },
+    { role: 'system', content: SYSTEM_PROMPT },
     { role: 'user', content: req.input },
   ];
   const tools = TOOL_SPECS.map((t) => ({
@@ -73,20 +86,33 @@ async function runOpenaiLoop(req: ApiRunRequest, onEvent?: (chunk: string) => vo
   const maxSteps = req.maxSteps ?? 100; // 增加到100以支持复杂审查任务
   const usage = { requests: 0, prompt_tokens: 0, completion_tokens: 0 };
   let lastOutput = '';
+  let emptyRetries = 0;
 
-  // 上下文裁剪：防止工具结果无限累积导致上下文窗口溢出（模型返回空）
+  /**
+   * 上下文裁剪：防止工具结果无限累积导致上下文窗口溢出（模型返回空）。
+   *
+   * 必须成对删除 assistant(tool_calls) 与其全部 tool 回复：OpenAI 兼容接口要求
+   * 每个 tool_calls 后面紧跟对应 tool_call_id 的结果，只删 tool 消息会留下
+   * 孤儿 tool_calls，导致整个请求被 400 拒绝，长任务必然中断。
+   */
   const MAX_HISTORY_CHARS = 120000; // 约 3 万 token，覆盖绝大多数模型窗口
+  const sizeOf = (m: any) => (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length)
+    + (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0);
   const trimHistory = () => {
-    let total = messages.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length), 0);
-    while (total > MAX_HISTORY_CHARS && messages.length > 3) {
-      let idx = -1;
-      for (let i = 2; i < messages.length; i++) {
-        if (messages[i].role === 'tool') { idx = i; break; }
-      }
+    let total = messages.reduce((s, m) => s + sizeOf(m), 0);
+    let trimmed = 0;
+    // 保留 system + 首个 user 任务描述（前 2 条）
+    while (total > MAX_HISTORY_CHARS) {
+      const idx = messages.findIndex((m, i) => i >= 2 && m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0);
       if (idx === -1) break;
-      const removed = messages.splice(idx, 1)[0];
-      total -= (typeof removed.content === 'string' ? removed.content.length : 0);
+      let end = idx + 1;
+      while (end < messages.length && messages[end].role === 'tool') end++;
+      if (end >= messages.length) break; // 最近一轮未闭合，保留
+      const removed = messages.splice(idx, end - idx);
+      total -= removed.reduce((s, m) => s + sizeOf(m), 0);
+      trimmed++;
     }
+    if (trimmed > 0) log(`[trim] 已省略 ${trimmed} 轮早期工具调用记录以节省上下文`);
   };
 
   for (let step = 0; step < maxSteps; step++) {
@@ -99,7 +125,9 @@ async function runOpenaiLoop(req: ApiRunRequest, onEvent?: (chunk: string) => vo
         model: req.model,
         messages,
         tools,
-        maxTokens: 2048,
+        // 开发文档等长产物需要充足输出预算；2048 会把架构师的文档截断在半句话，
+        // 后续 devdoc 校验必然失败并触发无意义返工。
+        maxTokens: req.maxTokens ?? 8192,
         timeoutMs: req.provider.timeout_ms || 120_000,
         headers: req.provider.default_headers,
       });
@@ -124,11 +152,25 @@ async function runOpenaiLoop(req: ApiRunRequest, onEvent?: (chunk: string) => vo
     if (toolCalls.length === 0) {
       log(`[assistant] ${content.slice(0, 2000)}`);
       if (!content.trim()) {
+        // 空输出常见于上下文超限或中转异常，重试一次并提示压缩输出
+        if (emptyRetries < 1) {
+          emptyRetries++;
+          log('[warn] 模型返回空内容，裁剪历史后重试一次');
+          messages.push({ role: 'user', content: '上一次回复为空。请直接调用工具推进任务，不要输出空回复。' });
+          continue;
+        }
         log('[end] 模型无输出');
         return { run_id: runId, status: 'failed', output: lastOutput, report: undefined, usage };
       }
+      emptyRetries = 0;
       messages.push({ role: 'assistant', content });
-      messages.push({ role: 'user', content: '请继续：若任务已完成请调用 report 工具汇总；否则请继续使用工具完成任务。' });
+      // 输出被 max_tokens 截断时，提示模型分批写入而不是重头再来
+      messages.push({
+        role: 'user',
+        content: resp.finish_reason === 'length'
+          ? '你的输出被长度限制截断了。不要在回复里直接写长文档：请用 write_file 分批写入（第一段用默认覆盖模式，后续每段用 append: true 追加到同一文件），全部写完后调用 report 工具汇总。'
+          : '请继续：若任务已完成请调用 report 工具汇总；否则请继续使用工具完成任务。',
+      });
       continue;
     }
 
@@ -184,21 +226,33 @@ async function runAnthropicLoop(req: ApiRunRequest, onEvent?: (chunk: string) =>
   const maxSteps = req.maxSteps ?? 100; // 增加到100以支持复杂审查任务
   const usage = { requests: 0, prompt_tokens: 0, completion_tokens: 0 };
   let lastOutput = '';
+  let nudges = 0;
 
-  // 上下文裁剪：防止工具结果无限累积导致上下文窗口溢出（模型返回空）
+  /**
+   * 上下文裁剪：assistant(tool_use) 与随后的 user(tool_result) 必须成对删除，
+   * 否则 Anthropic 会因 tool_use 缺少对应 tool_result 直接 400。
+   *
+   * 这里整轮删除且不插入占位消息：Anthropic 要求 user/assistant 严格交替，
+   * 每轮插一条 assistant 占位会产生连续同角色消息，同样会被 400 拒绝。
+   * 整轮删除后剩下的仍是 user → assistant → user 的合法交替序列。
+   */
   const MAX_HISTORY_CHARS = 120000;
+  const sizeOf = (m: any) => (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length);
   const trimHistory = () => {
-    let total = messages.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length), 0);
-    while (total > MAX_HISTORY_CHARS && messages.length > 2) {
-      let idx = -1;
-      for (let i = 1; i < messages.length; i++) {
-        // anthropic 的 tool_result 是 content 为数组的 user 消息
-        if (messages[i].role === 'user' && Array.isArray(messages[i].content)) { idx = i; break; }
-      }
+    let total = messages.reduce((s, m) => s + sizeOf(m), 0);
+    let trimmed = 0;
+    while (total > MAX_HISTORY_CHARS) {
+      const idx = messages.findIndex((m, i) =>
+        i >= 1 && m.role === 'assistant' && Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_use'));
       if (idx === -1) break;
-      const removed = messages.splice(idx, 1)[0];
-      total -= JSON.stringify(removed.content ?? '').length;
+      let end = idx + 1;
+      while (end < messages.length && messages[end].role === 'user' && Array.isArray(messages[end].content)) end++;
+      if (end >= messages.length) break; // 最近一轮未闭合，保留
+      const removed = messages.splice(idx, end - idx);
+      total -= removed.reduce((s, m) => s + sizeOf(m), 0);
+      trimmed++;
     }
+    if (trimmed > 0) log(`[trim] 已省略 ${trimmed} 轮早期工具调用记录以节省上下文`);
   };
 
   for (let step = 0; step < maxSteps; step++) {
@@ -211,7 +265,9 @@ async function runAnthropicLoop(req: ApiRunRequest, onEvent?: (chunk: string) =>
         model: req.model,
         messages,
         tools,
-        maxTokens: 2048,
+        system: SYSTEM_PROMPT,
+        // 与 OpenAI 分支保持一致：长文档产物需要足够输出预算
+        maxTokens: req.maxTokens ?? 8192,
         timeoutMs: req.provider.timeout_ms || 120_000,
       });
     } catch (err) {
@@ -237,14 +293,23 @@ async function runAnthropicLoop(req: ApiRunRequest, onEvent?: (chunk: string) =>
         log('[end] 模型无输出');
         return { run_id: runId, status: 'failed', output: lastOutput, report: undefined, usage };
       }
-      if (resp.stopReason === 'end_turn') {
-        log('[end] 对话结束（模型未调用 report）');
+      // end_turn 只代表这一轮说完了。直接判失败会让"干完活但忘记调用 report"
+      // 的任务整条流水线报废，这里先催办两次再放弃。
+      if (nudges >= 2) {
+        log('[end] 多次提示后模型仍未调用 report');
         return { run_id: runId, status: 'failed', output: lastOutput, report: undefined, usage };
       }
+      nudges++;
       messages.push({ role: 'assistant', content: blocks });
-      messages.push({ role: 'user', content: '请继续：若任务已完成请调用 report 工具汇总；否则请继续使用工具完成任务。' });
+      messages.push({
+        role: 'user',
+        content: resp.stopReason === 'max_tokens'
+          ? '你的输出被长度限制截断了。不要在回复里直接写长文档：请用 write_file 分批写入（第一段用默认覆盖模式，后续每段用 append: true 追加到同一文件），全部写完后调用 report 工具汇总。'
+          : '你还没有调用 report 工具。若任务已完成，请立即调用 report 工具输出结构化结果；否则请继续使用工具完成任务。',
+      });
       continue;
     }
+    nudges = 0;
 
     messages.push({ role: 'assistant', content: blocks });
 

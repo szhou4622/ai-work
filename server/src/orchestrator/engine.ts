@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { appendFileSync } from 'node:fs';
 import path from 'node:path';
 import { execSync, spawnSync } from 'node:child_process';
@@ -180,11 +180,35 @@ function extractReport(output: string): string | null {
   return m ? m[1].trim() : null;
 }
 
+/**
+ * 结论判定：优先读结构化首行 `VERDICT: PASS|FAIL`（角色提示词已要求这么写）。
+ *
+ * 不能对全文做 /\bFAIL\b/ 匹配：审查者写"未发现 FAIL 项"、输出里出现
+ * fail.test.ts 之类的文件名、或复述上一轮失败原因，都会被误判成 FAIL，
+ * 把任务推进无谓的返工直至耗尽配额。
+ */
 function verdictOf(report: string | null, output: string, ok: boolean): 'PASS' | 'FAIL' {
   if (!ok) return 'FAIL';
-  const t = (report ?? output).toUpperCase();
-  if (t.includes('REPORT_OK: FAIL') || /\bFAIL\b/.test(t)) return 'FAIL';
-  return 'PASS';
+  const text = (report ?? output ?? '').trim();
+  if (!text) return 'FAIL';
+
+  // 1) 结构化判定：扫描前若干行，找 VERDICT:/REPORT_OK: 显式结论
+  const lines = text.split('\n').slice(0, 5);
+  for (const line of lines) {
+    const m = line.match(/^\s*(?:VERDICT|REPORT_OK)\s*[:：]\s*(PASS|FAIL)\b/i);
+    if (m) return m[1].toUpperCase() === 'PASS' ? 'PASS' : 'FAIL';
+  }
+
+  // 2) 回退：全文找显式结论标记（模型把结论写在正文中部时）
+  const explicit = text.match(/(?:VERDICT|REPORT_OK)\s*[:：]\s*(PASS|FAIL)\b/i);
+  if (explicit) {
+    console.warn('[engine] 结论不在首行，已回退全文匹配（建议检查角色提示词是否被覆盖）');
+    return explicit[1].toUpperCase() === 'PASS' ? 'PASS' : 'FAIL';
+  }
+
+  // 3) 无结构化结论：保守判 FAIL，但记录告警便于排查
+  console.warn(`[engine] 未找到结构化结论（VERDICT: PASS|FAIL），保守判 FAIL。输出片段：${text.slice(0, 200)}`);
+  return 'FAIL';
 }
 
 /** 执行一次角色运行（CLI 或 API），落库 AgentRun/Handoff 并流式推送 */
@@ -240,6 +264,9 @@ async function executeRole(
     try {
       const runReq = resolveApiRun(db, agent, deps.secrets, input, workdir);
       runReq.maxSteps = 100; // 增加到100以支持复杂审查任务
+      // 架构/计划节点要产出架构文档与开发文档，输出预算不足会把文档截断在半句话，
+      // 后续校验必然失败并触发无意义返工，所以这两类节点单独放宽。
+      if (nodeId === 'clarify' || nodeId === 'plan') runReq.maxTokens = 16384;
       const result = await runApiAgent(runReq, onEvent);
       report = result.report ?? null;
       output = result.output;
@@ -320,9 +347,37 @@ async function executeRole(
   return { runId, report, output, ok };
 }
 
+/**
+ * 兜底：架构师把开发文档写到了别处时，找出最可能的那一份并归位到 docs/devdoc.md。
+ * 提示词已明确要求路径，这里只处理模型不听话的情况，避免流水线直接卡死。
+ */
+function recoverMisplacedDevdoc(repo: string): boolean {
+  const target = path.join(repo, 'docs', 'devdoc.md');
+  const candidates = [
+    'devdoc.md', 'DEVDOC.md',
+    path.join('docs', 'DEVDOC.md'), path.join('docs', 'dev-doc.md'),
+    path.join('docs', 'design.md'), path.join('docs', 'devdoc.markdown'),
+    'design.md', 'DESIGN.md', 'ARCHITECTURE.md',
+  ];
+  for (const rel of candidates) {
+    const p = path.join(repo, rel);
+    if (p === target || !existsSync(p)) continue;
+    try {
+      const content = readFileSync(p, 'utf-8');
+      if (content.trim().length < 200) continue; // 太短，不像开发文档
+      mkdirSync(path.dirname(target), { recursive: true });
+      writeFileSync(target, content, 'utf-8');
+      console.warn(`[engine] 开发文档位置不符（${rel}），已复制到 docs/devdoc.md`);
+      return true;
+    } catch { /* 读取失败则继续尝试下一个候选 */ }
+  }
+  return false;
+}
+
 function registerDevdoc(tc: TaskContext): { version: number; content: string } | null {
   const db = getDb();
   const p = path.join(tc.repo, 'docs', 'devdoc.md');
+  if (!existsSync(p) && !recoverMisplacedDevdoc(tc.repo)) return null;
   if (!existsSync(p)) return null;
   const version = tc.devdocVersion + 1;
   tc.devdocVersion = version;
@@ -582,12 +637,12 @@ async function runPipeline(tc: TaskContext, task: any, deps: EngineDeps): Promis
         commitWorkdir(tc.repo, 'task implementation');
         saveContext(tc); // 实现完成后保存
         transition(tc.taskId, 'REVIEWING', { nodeId: 'review' }, deps.hub);
-        const reviewVerdict = await runReview(tc, deps, devdoc, impl.runId);
-        if (reviewVerdict === 'FAIL') {
+        const review = await runReview(tc, deps, devdoc, impl.runId);
+        if (review.verdict === 'FAIL') {
           tc.reviewIter++;
           saveContext(tc); // 审查失败后保存
           if (tc.reviewIter > maxReview) return finishTask(tc, deps, 'NEEDS_HUMAN', `审查返工超过 ${maxReview} 次`);
-          fixContext = `审查问题：${tc.lastReviewIssues}`;
+          fixContext = `审查问题：${review.issues}`;
           transition(tc.taskId, 'FIXING', { nodeId: 'review', reason: `第 ${tc.reviewIter} 次返工` }, deps.hub);
           continue;
         }
@@ -599,7 +654,9 @@ async function runPipeline(tc: TaskContext, task: any, deps: EngineDeps): Promis
 
     // —— 阶段 B：QA + 验收门 ——
     transition(tc.taskId, 'TESTING', { nodeId: 'qa' }, deps.hub);
-    const qaPrompt = `请按开发文档 docs/devdoc.md 的验收命令执行构建与测试，通过则 report 输出 REPORT_OK: PASS；失败则 REPORT_OK: FAIL 并说明原因。`;
+    const qaPrompt = `请按开发文档 docs/devdoc.md 的"验收命令"章节执行构建与测试。
+
+完成后必须调用 report 工具，summary 第一行必须是 \`VERDICT: PASS\` 或 \`VERDICT: FAIL\`，第二行起写执行了哪些命令、输出摘要与失败原因。`;
     const qa = await executeRole(tc, 'qa', qaPrompt, deps, 'qa');
     const qaVerdict = verdictOf(qa.report, qa.output, qa.ok);
     if (qaVerdict === 'FAIL') {
@@ -752,6 +809,7 @@ async function runModuleWithReview(
   let ctx = fixContext;
   let lastImplRunId = '';
   let agentOverride: string | undefined;
+  let moduleReviewIter = 0;
 
   for (let i = 0; i <= maxReview + 2; i++) {
     if (tc.cancelled) return { ok: false, summary: '用户取消' };
@@ -785,14 +843,15 @@ async function runModuleWithReview(
 
     lastImplRunId = impl.runId;
     commitWorkdir(workdir, `module ${moduleId} implementation`);
-    const reviewVerdict = await runReview(tc, deps, devdoc, impl.runId, workdir);
-    if (reviewVerdict === 'FAIL') {
-      // 审查不过 → 直接退回该执行者修改，直到审查通过
-      tc.reviewIter++;
-      if (tc.reviewIter > maxReview) {
+    const review = await runReview(tc, deps, devdoc, impl.runId, workdir, moduleReviewIter + 1);
+    if (review.verdict === 'FAIL') {
+      // 审查不过 → 直接退回该执行者修改，直到审查通过。
+      // 计数与问题文本按模块独立，避免并行模块互相消耗返工配额、互相覆盖问题描述。
+      moduleReviewIter++;
+      if (moduleReviewIter > maxReview) {
         return { ok: false, needHuman: true, summary: `模块 ${moduleId} 审查返工超过 ${maxReview} 次，需人工介入` };
       }
-      ctx = `审查问题：${tc.lastReviewIssues}`;
+      ctx = `审查问题：${review.issues}`;
       continue;
     }
     return { ok: true, summary: `模块 ${moduleId}: ${(impl.report ?? impl.output).slice(0, 300)}` };
@@ -886,9 +945,31 @@ ${JSON.stringify(modules, null, 2)}
   return {};
 }
 
+/**
+ * 解析审查基线：返回可复现本次改动的 diff 命令参数。
+ *
+ * 单模块模式在主工作树上直接提交，`main...HEAD` 恒为空（HEAD 就是 main），
+ * 审查者因此看不到任何改动而一律判 FAIL。这里按工作树的真实位置选基线：
+ * - 在 task/* 模块分支上：main...HEAD（分支相对主干的全部改动）
+ * - 在主分支上：HEAD~1..HEAD（本轮实现提交）
+ */
+function resolveDiffRange(workdir: string): string {
+  const branch = execSync2('git', ['rev-parse', '--abbrev-ref', 'HEAD'], workdir).output.trim();
+  const onMain = branch === 'main' || branch === 'master' || branch === 'HEAD';
+  if (!onMain && git(workdir, ['rev-parse', '--verify', 'main']).ok) {
+    return 'main...HEAD';
+  }
+  // 主分支：用上一个提交作基线；只有一个提交时退化为空树对比
+  if (execSync2('git', ['rev-parse', '--verify', 'HEAD~1'], workdir).ok) {
+    return 'HEAD~1..HEAD';
+  }
+  const empty = execSync2('git', ['hash-object', '-t', 'tree', '/dev/null'], workdir).output.trim();
+  return empty ? `${empty}..HEAD` : 'HEAD';
+}
+
 /** 统计 git diff 复杂度（文件数、增减行数），用于审查分层 */
-function diffStats(workdir: string): { files: number; lines: number } {
-  const r = execSync2('git', ['diff', 'main...HEAD', '--stat'], workdir);
+function diffStats(workdir: string, range: string): { files: number; lines: number } {
+  const r = execSync2('git', ['diff', range, '--stat'], workdir);
   const out = r.output;
   const fileMatches = out.match(/files? changed/i);
   const files = fileMatches ? Number((out.match(/(\d+)\s+files? changed/i) ?? [])[1] ?? 0) : 0;
@@ -930,22 +1011,35 @@ async function runReview(
   devdoc: { version: number; content: string },
   targetRunId: string,
   workdir?: string,
-): Promise<'PASS' | 'FAIL'> {
+  iteration?: number,
+): Promise<{ verdict: 'PASS' | 'FAIL'; issues: string }> {
   const db = getDb();
   // 审查分层：按变更复杂度选择高质量(Pro)/低质量(Flash)审查 Agent
-  const stats = diffStats(workdir ?? tc.repo);
+  const reviewDir = workdir ?? tc.repo;
+  const range = resolveDiffRange(reviewDir);
+  const stats = diffStats(reviewDir, range);
   const useHigh = stats.files >= 5 || stats.lines >= 300;
   const reviewerAgent = resolveReviewerAgent(tc, useHigh);
 
   transition(tc.taskId, 'REVIEWING', { nodeId: 'review', agentRunId: targetRunId }, deps.hub);
-  const reviewPrompt = `（${useHigh ? '高质量审查' : '常规审查'}）请对照开发文档 docs/devdoc.md 审查当前实现：读取文件、查看 git diff（git diff main...HEAD）、运行检查命令，输出 REPORT_OK: PASS 或 REPORT_OK: FAIL 并列出具体问题。`;
+  const reviewPrompt = `（${useHigh ? '高质量审查' : '常规审查'}）请对照开发文档 docs/devdoc.md 审查当前实现。
+
+查看本次改动请使用（基线已由引擎确定，请照用）：
+  git diff ${range} --stat
+  git diff ${range}
+
+本次改动规模：${stats.files} 个文件，${stats.lines} 行增删。
+
+审查后必须调用 report 工具，summary 第一行必须是 \`VERDICT: PASS\` 或 \`VERDICT: FAIL\`，第二行起列出具体问题。`;
   const review = await executeRole(tc, 'reviewer', reviewPrompt, deps, 'review', workdir, reviewerAgent?.id);
   const verdict = verdictOf(review.report, review.output, review.ok);
-  tc.lastReviewIssues = (review.report ?? review.output).slice(0, 3000);
+  const issues = (review.report ?? review.output ?? '').slice(0, 3000);
+  // 并行模块各自持有返工计数与问题文本，这里只回填单模块串行路径使用的字段
+  tc.lastReviewIssues = issues;
   db.prepare(
     'INSERT INTO reviews (id, task_id, reviewer_run_id, target_agent_run_id, verdict, issues, iteration) VALUES (?, ?, ?, ?, ?, ?, ?)',
-  ).run(crypto.randomUUID(), tc.taskId, review.runId, targetRunId, verdict, JSON.stringify([{ tier: useHigh ? 'high' : 'low', stats }]), tc.reviewIter + 1);
-  return verdict;
+  ).run(crypto.randomUUID(), tc.taskId, review.runId, targetRunId, verdict, JSON.stringify([{ tier: useHigh ? 'high' : 'low', stats, range }]), iteration ?? tc.reviewIter + 1);
+  return { verdict, issues };
 }
 
 /** 整合：合并各模块分支回主分支，然后清理 Worktree */
